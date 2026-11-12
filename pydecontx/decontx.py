@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from .rrng import RRandom
+from ._core import _entries as _core_entries
 from ._core import (
     calculate_native_matrix,
     decontx_em,
@@ -127,7 +129,7 @@ def decontx(x, z=None, batch=None, background=None, max_iter: int = 500,
             delta=(10.0, 10.0), estimate_delta: bool = True,
             convergence: float = 0.001, iter_log_lik: int = 10,
             seed: int | None = 12345, layer=None, copy: bool = False,
-            verbose: bool = False) -> DecontXResult:
+            verbose: bool = False, n_jobs: int = 1) -> DecontXResult:
     """Estimate and remove ambient-RNA contamination with DecontX.
 
     Parameters
@@ -162,7 +164,8 @@ def decontx(x, z=None, batch=None, background=None, max_iter: int = 500,
     iter_log_lik : int
         Record the log-likelihood every this many iterations.
     seed : int or None
-        Seed for the random initialisation of ``theta``.
+        Seed for the random initialisation of ``theta``; drawn with R's generator, so a seed
+        gives the same initial values (and results) as ``decontX(..., seed = seed)`` in R.
     layer : str, optional
         AnnData layer to use instead of ``.X``.
     copy : bool
@@ -171,6 +174,8 @@ def decontx(x, z=None, batch=None, background=None, max_iter: int = 500,
         instead of a :class:`DecontXResult`.
     verbose : bool
         Print per-iteration progress.
+    n_jobs : int
+        Threads for the per-transcript updates (default 1, as R). Results do not depend on it.
 
     Returns
     -------
@@ -240,7 +245,7 @@ def decontx(x, z=None, batch=None, background=None, max_iter: int = 500,
         res = _decontx_one_batch(
             counts_bat, z_bat, bg_bat, max_iter=max_iter, delta=delta,
             estimate_delta=estimate_delta, convergence=convergence,
-            iter_log_lik=iter_log_lik, seed=seed, verbose=verbose)
+            iter_log_lik=iter_log_lik, seed=seed, verbose=verbose, n_jobs=n_jobs)
 
         native = calculate_native_matrix(
             counts_bat, res["theta"], res["eta"], res["phi"],
@@ -294,17 +299,20 @@ def _to_genes_by_cells_sparse(counts) -> sp.csc_matrix:
 
 def _decontx_one_batch(counts, z, background, max_iter, delta,
                        estimate_delta, convergence, iter_log_lik,
-                       seed, verbose):
+                       seed, verbose, n_jobs=1):
     """Run the variational-EM loop for a single batch of cells."""
     counts = counts.tocsc().astype(float)
     G, C = counts.shape
     z = _process_cell_labels(z, C)
 
-    rng = np.random.default_rng(seed)
     delta = np.asarray(delta, dtype=float)
 
-    # Initial per-cell native proportion theta ~ Beta(delta).
-    theta = rng.beta(delta[0], delta[1], size=C)
+    # Initial native proportions: R draws rbeta(nC, delta[1], delta[2]) inside
+    # withr::with_seed(seed, ...) for every batch, so the same seed gives the same draws.
+    if seed is None:
+        theta = np.random.default_rng().beta(delta[0], delta[1], size=C)
+    else:
+        theta = RRandom(seed).rbeta(C, delta[0], delta[1])
 
     init = decontx_initialize(counts, theta, z, pseudocount=1e-20)
     phi = init["phi"]
@@ -320,7 +328,8 @@ def _decontx_one_batch(counts, z, background, max_iter, delta,
         estimate_eta = False
 
     counts_colsums = np.asarray(counts.sum(axis=0)).ravel()
-    ll = [decontx_loglik(counts, theta, eta, phi, z, pseudocount=1e-20)]
+    entries = _core_entries(counts, z)
+    ll = [decontx_loglik(counts, theta, eta, phi, z, pseudocount=1e-20, entries=entries, n_jobs=n_jobs)]
 
     theta_prev = theta.copy()
     converged = False
@@ -332,7 +341,7 @@ def _decontx_one_batch(counts, z, background, max_iter, delta,
         next_decon = decontx_em(
             counts, counts_colsums, theta, eta, phi, z,
             estimate_eta=estimate_eta, estimate_delta=estimate_delta,
-            delta=delta, pseudocount=1e-20)
+            delta=delta, pseudocount=1e-20, entries=entries, n_jobs=n_jobs)
         theta = next_decon["theta"]
         phi = next_decon["phi"]
         eta = next_decon["eta"]
@@ -346,7 +355,7 @@ def _decontx_one_batch(counts, z, background, max_iter, delta,
 
         if iter_count % iter_log_lik == 0 or converged:
             ll.append(decontx_loglik(counts, theta, eta, phi, z,
-                                     pseudocount=1e-20))
+                                     pseudocount=1e-20, entries=entries, n_jobs=n_jobs))
             if verbose:
                 print(f"  iter {iter_count} | converge: {max_div:.4g}")
 

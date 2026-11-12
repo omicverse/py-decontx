@@ -4,12 +4,9 @@ Both sides run the variational-EM of DecontX on the *identical* small
 synthetic two/three-population contaminated count matrix (written by
 ``conftest.py``) with the identical cluster labels and seed.
 
-The contamination-fraction estimate and the decontaminated count matrix
-are deterministic given the data, but the R initialisation of ``theta``
-(``stats::rbeta`` under ``withr::with_seed``) uses R's Mersenne-Twister
-RNG, which differs from numpy's PCG64. The EM is therefore checked for
-high agreement (Pearson > 0.99 -- the level the DecontX paper reports
-against ground truth) rather than bit-exactness.
+The EM is deterministic given the initial ``theta``, which R draws with ``stats::rbeta`` under
+``withr::with_seed``; pydecontx draws it with a port of R's generator (``pydecontx.rrng``), so the
+same seed gives the same initial values and both sides agree to rounding (checked to 1e-9).
 """
 from __future__ import annotations
 
@@ -45,8 +42,7 @@ def test_contamination_matches_r(r_reference, py_result):
     assert len(r) == len(p)
     corr = pearsonr(r, p)[0]
     assert corr > TOL_CORR, f"contamination Pearson r={corr:.4f}"
-    # absolute agreement: mean contamination within a few percent
-    assert abs(r.mean() - p.mean()) < 0.03
+    np.testing.assert_allclose(p, r, rtol=0, atol=1e-9)
 
 
 def test_contamination_matches_ground_truth(r_reference, py_result,
@@ -73,6 +69,7 @@ def test_decontx_counts_match_r(r_reference, py_result):
     r_cs = r.values.sum(axis=0)
     p_cs = p.sum(axis=0)
     assert pearsonr(r_cs, p_cs)[0] > TOL_CORR
+    np.testing.assert_allclose(p, r.values, rtol=1e-9, atol=1e-9)
 
 
 def test_theta_matches_r(r_reference, py_result):
@@ -80,6 +77,7 @@ def test_theta_matches_r(r_reference, py_result):
     p = py_result.estimates["all_cells"]["theta"]
     corr = pearsonr(r, p)[0]
     assert corr > TOL_CORR, f"theta Pearson r={corr:.4f}"
+    np.testing.assert_allclose(p, r, rtol=0, atol=1e-9)
 
 
 # ----------------------------------------------------------------------
@@ -95,3 +93,4 @@ def test_background_mode_matches_r(r_reference, synthetic):
                    max_iter=500).contamination
     corr = pearsonr(r, p)[0]
     assert corr > TOL_CORR, f"background contamination Pearson r={corr:.4f}"
+    np.testing.assert_allclose(p, r, rtol=0, atol=1e-9)

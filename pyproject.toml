@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pydecontx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pure-Python port of the Bioconductor decontX package — decontamination of ambient RNA in single-cell RNA-seq via a Bayesian two-component multinomial mixture."
 readme = "README.md"
 requires-python = ">=3.9"

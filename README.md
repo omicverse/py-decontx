@@ -5,9 +5,9 @@ A **pure-Python re-implementation of [DecontX](https://github.com/campbio/decont
 - AnnData-native — drop-in for the scanpy ecosystem
 - **No `rpy2`**, no R install — the variational-EM, the native/contamination multinomial mixture, and the Minka fixed-point Dirichlet MLE are all implemented directly in NumPy/SciPy
 - Same function surface as the R workflow (`decontX` → per-cell contamination fraction + decontaminated count matrix)
-- Numerical reproducibility against the Bioconductor reference — contamination fraction, decontaminated matrix and per-cell `theta` agree at Pearson r > 0.99 (see `tests/test_r_parity.py`)
+- Same results as Bioconductor decontX 1.8.0 for the same seed: the initial `theta` is drawn with R's random number generator, and contamination, `theta` and the decontaminated matrix agree to rounding (see [Relationship to R decontX](#relationship-to-r-decontx))
 
-> This is a **standalone mirror** of the canonical implementation that lives in [`omicverse`](https://github.com/Starlitnightly/omicverse). All algorithmic work is developed upstream in omicverse and synced here for users who want DecontX without the full omicverse stack.
+> omicverse uses this package for `ov.pp.ambient.remove_ambient(adata, method='decontx')`.
 
 ## Install
 
@@ -94,20 +94,26 @@ alpha = fit_dirichlet(proportions)["alpha"]
 | `calculate_native_matrix` | `calculateNativeMatrix` (C++) | decontaminated-matrix computation |
 | `fit_dirichlet` | `MCMCprecision::fit_dirichlet` | Minka fixed-point Dirichlet MLE |
 
-## Reproducing R results
+## Relationship to R decontX
 
-`examples/compare_R_vs_Python.ipynb` runs Bioconductor `decontX` (via `Rscript`) and `pydecontx` on the **same real PBMC 3k dataset** with identical cluster labels, and shows the per-cell contamination fraction, the decontaminated count matrix and the per-cell `theta` all agree at Pearson r > 0.99.
+pydecontx follows decontX 1.8.0. decontX draws the initial native proportions with
+`rbeta(nCells, delta[1], delta[2])` inside `withr::with_seed(seed, ...)`; pydecontx draws them with a
+port of R's Mersenne-Twister and of `rbeta` (Cheng's algorithms; `pydecontx.rrng`), so the same `seed`
+gives the same start. The variational EM then follows the C++ loops of decontX: on five 10x
+human–mouse mixtures (`report/`) both packages stop after the same number of iterations, and the
+per-cell contamination agrees to ~1e-14 and the decontaminated counts to ~1e-11.
 
-`tests/test_r_parity.py` runs the **same synthetic two/three-population contaminated count matrix** — with identical cluster labels — through Bioconductor `decontX` (R) and `pydecontx`, and asserts agreement on the contamination fraction, the decontaminated matrix, the final `theta`, and the background-anchored mode.
+The per-transcript updates are vectorised and computed in cache-sized blocks; `n_jobs` spreads the
+blocks over threads without changing the result.
 
-**Unavoidable difference.** The variational EM is deterministic *given its initial `theta`*, but `theta` is seeded by a Beta draw: R uses its Mersenne-Twister RNG (`stats::rbeta` under `withr::with_seed`), NumPy uses PCG64. The two initialisations differ, so the converged estimates agree to high correlation rather than bit-exactly. R also runs the EM inner loops in C++; `pydecontx` reproduces them in vectorised NumPy.
+`tests/test_r_parity.py` runs decontX through `Rscript` (set `PYDECONTX_RSCRIPT`) and checks
+contamination, `theta`, the decontaminated matrix and the background mode to 1e-9;
+`tests/test_r_reference.py` checks R's `rbeta` draws against stored values (no R needed).
 
-## Relationship to omicverse
+## Use in omicverse
 
-Developed **upstream** in [`omicverse`](https://github.com/Starlitnightly/omicverse):
-
-- Canonical implementation: synced to omicverse
-- Standalone mirror (this repo): same code, same API, minus the omicverse packaging
+`ov.pp.ambient.remove_ambient(adata, method='decontx', cluster_key=...)` runs pydecontx on a
+filtered, clustered AnnData.
 
 ## Citation
 
