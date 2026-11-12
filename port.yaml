@@ -11,21 +11,21 @@ domain: single-cell   # single-cell | spatial | trajectory | bulk | proteomics |
 upstream:
   name: "decontX"
   source: "Bioconductor"   # CRAN | Bioconductor | GitHub | other
-  version: null   # TODO: upstream version the parity test was run against
+  version: "1.8.0"
   url: "https://bioconductor.org/packages/decontX"
-  license: null   # TODO: upstream R package license (GPL-3, MIT, Artistic-2.0, …)
+  license: "MIT"
   citation: "Yang, S. et al. Decontamination of ambient RNA in single-cell RNA-seq with DecontX. Genome Biology 21, 57 (2020)."
 omicverse:
-  module: null   # TODO: e.g. ov.single.pyDoubletFinder, or leave null
+  module: "ov.pp.ambient.remove_ambient(method='decontx')"
   since: null
 parity:
-  status: unverified   # pass | partial | unverified
-  algorithm_class: null   # TODO: see omicverse-rebuildr/PARITY_TAXONOMY.md
-  metric: null   # TODO: pearson | spearman | ari | jaccard | max_abs_diff | …
-  threshold: null
-  value: null   # TODO: measured value on the canonical fixture
-  fixture: null
-  test: null
+  status: pass   # same seed -> same initial theta (R RNG + rbeta port); EM follows the C++ loops
+  algorithm_class: stochastic-seeded
+  metric: per-cell contamination and decontaminated counts max_abs_diff; iterations
+  threshold: "same iterations; contamination < 1e-9"
+  value: "5 10x human-mouse mixtures: same iterations, contamination ~1e-14, counts ~1e-11"
+  fixture: "10x hgmm_1k_v3 / 5k_v3 / 6k / 10k_v3 / 12k (shared clusters)"
+  test: "tests/test_r_parity.py (live R, PYDECONTX_RSCRIPT); tests/test_r_reference.py"
 artifacts:
   audit: null
   report: null

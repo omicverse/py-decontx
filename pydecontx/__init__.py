@@ -30,7 +30,7 @@ from ._dirichlet import fit_dirichlet
 from .decontx import DecontXResult, decontx
 from .simulate import simulate_contamination
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "decontx",

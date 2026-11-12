@@ -32,8 +32,36 @@ __all__ = [
 def _as_csc(counts) -> sp.csc_matrix:
     """Return ``counts`` as a float CSC sparse matrix (genes x cells)."""
     if sp.issparse(counts):
-        return counts.tocsc().astype(float)
+        return counts.tocsc().astype(float, copy=False)
     return sp.csc_matrix(np.asarray(counts, dtype=float))
+
+
+def _entries(counts, z, entries=None):
+    """Nonzero entries of a genes x cells CSC matrix in column order: gene, cell, cluster, value
+    and the flat index ``gene * K + cluster`` into a C-ordered genes x clusters array.
+    ``entries`` returns a precomputed tuple (the EM loop computes it once per batch)."""
+    if entries is not None:
+        return entries
+    z = np.asarray(z, dtype=int)
+    cols = np.repeat(np.arange(counts.shape[1]), np.diff(counts.indptr))
+    k = z[cols] - 1
+    rows64 = counts.indices.astype(np.int64)
+    return (counts.indices, cols, k, counts.data, rows64 * int(z.max()) + k, np.diff(counts.indptr),
+            k.astype(np.int64) * counts.shape[0] + rows64)       # F-order index: one cluster column per cell
+
+
+_BLOCK = 1 << 18                                                  # entries per block: temporaries stay in cache
+
+
+def _for_blocks(n, fn, n_jobs=1):
+    """Run ``fn(start, stop)`` on consecutive blocks of ``n`` entries, on ``n_jobs`` threads
+    (NumPy releases the GIL inside the per-block array operations)."""
+    spans = [(b0, min(b0 + _BLOCK, n)) for b0 in range(0, n, _BLOCK)]
+    if n_jobs is None or n_jobs <= 1 or len(spans) < 2:
+        return [fn(a, b) for a, b in spans]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(n_jobs) as ex:
+        return list(ex.map(lambda ab: fn(*ab), spans))
 
 
 def decontx_initialize(counts, theta, z, pseudocount: float = 1e-20):
@@ -65,15 +93,8 @@ def decontx_initialize(counts, theta, z, pseudocount: float = 1e-20):
     G, C = counts.shape
     K = int(z.max())
 
-    phi = np.full((G, K), pseudocount, dtype=float)
-    indptr, indices, data = counts.indptr, counts.indices, counts.data
-    for j in range(C):
-        k = z[j] - 1
-        start, end = indptr[j], indptr[j + 1]
-        rows = indices[start:end]
-        vals = data[start:end] * theta[j]
-        np.add.at(phi[:, k], rows, vals)
-
+    rows, cols, k, x, f, per_cell, f_col = _entries(counts, z)
+    phi = pseudocount + np.bincount(f, x * theta[cols], minlength=G * K).reshape(G, K)
     phi_rowsum = phi.sum(axis=1)
     eta = phi_rowsum[:, None] - phi
 
@@ -84,7 +105,7 @@ def decontx_initialize(counts, theta, z, pseudocount: float = 1e-20):
 
 def decontx_em(counts, counts_colsums, theta, eta, phi, z,
                estimate_eta: bool = True, estimate_delta: bool = True,
-               delta=(10.0, 10.0), pseudocount: float = 1e-20):
+               delta=(10.0, 10.0), pseudocount: float = 1e-20, entries=None, n_jobs: int = 1):
     """One variational-EM update of the DecontX model.
 
     Port of the C++ ``decontXEM``. For every observed transcript the
@@ -114,24 +135,26 @@ def decontx_em(counts, counts_colsums, theta, eta, phi, z,
     G, C = counts.shape
     K = phi.shape[1]
 
-    new_phi = np.zeros((G, K), dtype=float)
-    native_total = np.zeros(C, dtype=float)
+    # every nonzero entry at once, summed in the order of the C++ loop (column by column)
+    rows, cols, k, x, f, per_cell, f_col = _entries(counts, z, entries)
+    # normp = pnative / (pcontamin + pnative) = 1 / (1 + q[i, k] * s[j]) with the per gene-and-cluster
+    # ratio q = (eta + pc) / (phi + pc) and the per-cell ratio s = (1 - theta + pc) / (theta + pc):
+    # five passes over the entries instead of nine, in cache-sized blocks; q is column-major, so the
+    # entries of a cell read one cluster column
+    q = ((np.asfortranarray(eta) + pseudocount) / (np.asfortranarray(phi) + pseudocount)).ravel(order="F")
+    s_cell = (1.0 - theta + pseudocount) / (theta + pseudocount)
+    px = np.empty(x.size)
 
-    indptr, indices, data = counts.indptr, counts.indices, counts.data
-    for j in range(C):
-        k = z[j] - 1
-        start, end = indptr[j], indptr[j + 1]
-        if start == end:
-            continue
-        rows = indices[start:end]
-        x = data[start:end]
-        p_native = (phi[rows, k] + pseudocount) * (theta[j] + pseudocount)
-        p_contam = (eta[rows, k] + pseudocount) * (1.0 - theta[j] + pseudocount)
-        normp = p_native / (p_native + p_contam)
-        px = normp * x
-        np.add.at(new_phi[:, k], rows, px)
-        native_total[j] = px.sum()
+    def block(b0, b1):
+        d = q.take(f_col[b0:b1])
+        d *= s_cell.take(cols[b0:b1])
+        d += 1.0
+        np.divide(x[b0:b1], d, out=d)
+        px[b0:b1] = d
 
+    _for_blocks(x.size, block, n_jobs)
+    new_phi = np.bincount(f, px, minlength=G * K).reshape(G, K)
+    native_total = np.bincount(cols, px, minlength=C)
     if estimate_eta:
         phi_rowsum = new_phi.sum(axis=1)
         new_eta = phi_rowsum[:, None] - new_phi
@@ -162,7 +185,7 @@ def decontx_em(counts, counts_colsums, theta, eta, phi, z,
     }
 
 
-def decontx_loglik(counts, theta, eta, phi, z, pseudocount: float = 1e-20):
+def decontx_loglik(counts, theta, eta, phi, z, pseudocount: float = 1e-20, entries=None, n_jobs: int = 1):
     """Two-component multinomial log-likelihood of the DecontX model.
 
     Port of the C++ ``decontXLogLik``:
@@ -174,18 +197,18 @@ def decontx_loglik(counts, theta, eta, phi, z, pseudocount: float = 1e-20):
     eta = np.asarray(eta, dtype=float)
     z = np.asarray(z, dtype=int)
 
-    loglik = 0.0
-    indptr, indices, data = counts.indptr, counts.indices, counts.data
-    for j in range(counts.shape[1]):
-        k = z[j] - 1
-        start, end = indptr[j], indptr[j + 1]
-        if start == end:
-            continue
-        rows = indices[start:end]
-        x = data[start:end]
-        mix = (phi[rows, k] * theta[j]
-               + eta[rows, k] * (1.0 - theta[j]) + pseudocount)
-        loglik += float(np.sum(x * np.log(mix)))
+    rows, cols, k, x, f, per_cell, f_col = _entries(counts, z, entries)
+    phi_c = np.asfortranarray(phi).ravel(order="F")
+    eta_c = np.asfortranarray(eta).ravel(order="F")
+
+    def block(b0, b1):
+        th = theta.take(cols[b0:b1])
+        mix = phi_c.take(f_col[b0:b1]) * th
+        mix += eta_c.take(f_col[b0:b1]) * (1.0 - th)
+        mix += pseudocount
+        return float(np.dot(x[b0:b1], np.log(mix)))
+
+    loglik = float(sum(_for_blocks(x.size, block, n_jobs)))
     return loglik
 
 
@@ -203,21 +226,11 @@ def calculate_native_matrix(counts, theta, eta, phi, z,
     eta = np.asarray(eta, dtype=float)
     z = np.asarray(z, dtype=int)
 
-    indptr, indices, data = counts.indptr, counts.indices, counts.data
-    out = data.copy()
-    for j in range(counts.shape[1]):
-        k = z[j] - 1
-        start, end = indptr[j], indptr[j + 1]
-        if start == end:
-            continue
-        rows = indices[start:end]
-        p_native = np.log(phi[rows, k] + pseudocount) + np.log(theta[j]
-                                                               + pseudocount)
-        p_contam = np.log(eta[rows, k] + pseudocount) + np.log(
-            1.0 - theta[j] + pseudocount)
-        normp = np.exp(p_native) / (np.exp(p_contam) + np.exp(p_native))
-        out[start:end] = data[start:end] * normp
-
+    rows, cols, k, x, f, per_cell, f_col = _entries(counts, z)
+    p_native = np.log(phi[rows, k] + pseudocount) + np.log(theta[cols] + pseudocount)
+    p_contam = np.log(eta[rows, k] + pseudocount) + np.log(1.0 - theta[cols] + pseudocount)
+    out = x * (np.exp(p_native) / (np.exp(p_contam) + np.exp(p_native)))
+    indices, indptr = counts.indices, counts.indptr
     native = sp.csc_matrix((out, indices.copy(), indptr.copy()),
                            shape=counts.shape)
     return native
